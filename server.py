@@ -5,6 +5,7 @@ Layers kept separate: plan_with_model (AI) / advance+receipt (state machine) / b
 """
 import os, re, json, time, uuid, hashlib, secrets, threading
 import httpx
+from collections import deque
 from fastapi import FastAPI, Body, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -79,10 +80,15 @@ Rules:
 - effect: exactly one tool from policy.effectTools that fixes the confirmed root cause.
   If the transcript shows the service is ALREADY AT its permitted scaling limit (max replicas/capacity), do NOT scale; choose the tool that pages the owner/on-call instead.
   Use rollback_deployment only for a bad deployment, disable_feature only for a faulty feature flag.
+- evidence: pick the transcript lines that DIRECTLY state or prove the root cause (a metric, log or event), never customer quotes, chatter or unrelated noise.
+- Copy identifiers (service, deployment, region, flag, ticket, version, time window) character for character from the transcript.
 - Output JSON only, no markdown."""
 
 PROVIDER = os.environ.get("LLM_PROVIDER", "openai")  # "gemini" = native Google API; "openai" = any OpenAI-compatible API
 ERRORS = []
+DEBUG = deque(maxlen=12)   # summaries of recent runs (owner debugging only)
+TRANSCRIPTS = {}            # runId -> synthetic transcript, last few runs only
+INFLIGHT = {}
 
 def note_error(stage, e):
     msg = {"stage": stage, "error": repr(e)[:300]}
@@ -326,6 +332,14 @@ def build_trace(st):
 def health():
     return {"ok": True}
 
+@app.get("/debug/runs")
+def debug_runs():
+    return list(DEBUG)
+
+@app.get("/debug/transcript/{run_id}")
+def debug_transcript(run_id: str):
+    return JSONResponse({"transcript": TRANSCRIPTS.get(run_id)})
+
 @app.get("/debug/errors")
 def debug_errors():  # error class/status only, never request content
     return ERRORS[-10:]
@@ -343,18 +357,29 @@ def create(request: Request, body: dict = Body(...)):
         marker = str(body["publicMarker"])
     except Exception:
         return err(422, "invalid request")
+    h = sha(body)
     with LOCK:
-        h = sha(body)
         old = RUNS.get(run_id)
         if old:
             return JSONResponse(old["firstResponse"]) if old["requestHash"] == h else err(409, "conflict")
+        run_lock = INFLIGHT.setdefault(run_id, threading.Lock())
+    with run_lock:
+        with LOCK:
+            old = RUNS.get(run_id)
+            if old:
+                return JSONResponse(old["firstResponse"]) if old["requestHash"] == h else err(409, "conflict")
         t0 = now()
         try:
-            plan = plan_with_model(body)
+            plan = plan_with_model(body)  # slow model call happens OUTSIDE the global lock
         except Exception as e:
             note_error("create", e)
             return err(502, "planner failed")
         t1 = now()
+        with LOCK:
+            return _finish_create(request, body, run_id, marker, h, plan, t0, t1)
+
+def _finish_create(request, body, run_id, marker, h, plan, t0, t1):
+    if True:
         tp, ts = request.headers.get("traceparent"), request.headers.get("tracestate")
         if not parse_tp(tp) and parse_tp(body.get("traceparent")):
             tp, ts = body["traceparent"], body.get("tracestate")
@@ -378,6 +403,28 @@ def create(request: Request, body: dict = Body(...)):
         st["firstResponse"] = resp
         RUNS[run_id] = st
         save()
+        try:
+            lines = {}
+            for ln in body["incident"]["transcript"].splitlines():
+                m = re.match(r"^[\s\-\*]*\[([^\]\s]+)\]", ln)
+                if m: lines[m.group(1)] = ln.strip()[:220]
+            DEBUG.append({"runId": run_id, "title": body["incident"].get("title"),
+                          "service": body["incident"].get("service"),
+                          "allowedRootCauses": body["incident"]["allowedRootCauses"],
+                          "toolNames": [t.get("name") for t in body["toolCatalog"]],
+                          "policy": {k: v for k, v in body["policy"].items() if k != "doNotExport"},
+                          "chosenRootCause": plan["rootCause"],
+                          "evidence": {e: lines.get(e) for e in plan["evidence"]},
+                          "diagnostics": [{"tool": d["toolName"], "args": d["arguments"], "evidence": d["evidence"]} for d in plan["diagnostics"]],
+                          "effect": {"tool": plan["effect"]["toolName"], "args": plan["effect"]["arguments"]},
+                          "needsApproval": st["needsApproval"],
+                          "incomingTraceparent": bool(ctx), "seconds": round((t1 - t0) / 1e9, 1),
+                          "transcriptChars": len(body["incident"]["transcript"])})
+            TRANSCRIPTS[run_id] = body["incident"]["transcript"]
+            for k in list(TRANSCRIPTS)[:-3]:
+                TRANSCRIPTS.pop(k, None)
+        except Exception as e:
+            note_error("debug", e)
         return JSONResponse(resp)
 
 @app.post("/v2/incidents/{run_id}/receipts")
