@@ -81,7 +81,36 @@ Rules:
   Use rollback_deployment only for a bad deployment, disable_feature only for a faulty feature flag.
 - Output JSON only, no markdown."""
 
+PROVIDER = os.environ.get("LLM_PROVIDER", "openai")  # "gemini" = native Google API; "openai" = any OpenAI-compatible API
+ERRORS = []
+
+def note_error(stage, e):
+    msg = {"stage": stage, "error": repr(e)[:300]}
+    print("ERROR:", msg, flush=True)
+    ERRORS.append(msg)
+    del ERRORS[:-20]
+
+def _parse_json(txt):
+    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
+    return json.loads(txt)
+
 def call_llm(user, timeout):
+    if PROVIDER == "gemini":
+        model = LLM_MODEL.replace("models/", "")
+        cfg = {"temperature": 0, "responseMimeType": "application/json"}
+        if os.environ.get("GEMINI_THINKING_BUDGET"):
+            cfg["thinkingConfig"] = {"thinkingBudget": int(os.environ["GEMINI_THINKING_BUDGET"])}
+        r = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": LLM_KEY},
+            json={"systemInstruction": {"parts": [{"text": SYSTEM}]},
+                  "contents": [{"role": "user", "parts": [{"text": user}]}],
+                  "generationConfig": cfg},
+            timeout=timeout)
+        if r.status_code >= 400:
+            raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:200]}")
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        return _parse_json("".join(p.get("text", "") for p in parts))
     r = httpx.post(
         LLM_BASE.rstrip("/") + "/chat/completions",
         headers={"Authorization": f"Bearer {LLM_KEY}"},
@@ -90,20 +119,19 @@ def call_llm(user, timeout):
               "messages": [{"role": "system", "content": SYSTEM},
                            {"role": "user", "content": user}]},
         timeout=timeout)
-    r.raise_for_status()
-    txt = r.json()["choices"][0]["message"]["content"].strip()
-    txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
-    return json.loads(txt)
+    if r.status_code >= 400:
+        raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:200]}")
+    return _parse_json(r.json()["choices"][0]["message"]["content"])
 
 def validate_plan(p, body, ids):
     inc, pol = body["incident"], body["policy"]
     catalog = {t["name"]: t for t in body["toolCatalog"]}
     effects = set(pol.get("effectTools", []))
     assert p["rootCause"] in inc["allowedRootCauses"], "rootCause must be copied from allowedRootCauses"
-    ev = list(dict.fromkeys(p["evidence"]))
-    assert 2 <= len(ev) <= 4 and all(e in ids for e in ev), "evidence must be 2-4 distinct IDs from the transcript"
-    diags = p["diagnostics"]
-    assert 1 <= len(diags) <= pol.get("maximumDiagnostics", 3), "wrong number of diagnostics"
+    ev = list(dict.fromkeys(e for e in p["evidence"] if e in ids))[:4]
+    assert len(ev) >= 2, "need 2-4 distinct evidence IDs that exist in the transcript"
+    diags = p["diagnostics"][: pol.get("maximumDiagnostics", 3)]
+    assert len(diags) >= 1, "need at least one diagnostic"
 
     def check(c, is_effect):
         t = c["toolName"]
@@ -120,7 +148,8 @@ def validate_plan(p, body, ids):
     for c in diags:
         d = check(c, False)
         k = canon([d["toolName"], d["arguments"]])
-        assert k not in seen, "duplicate diagnostic"
+        if k in seen:
+            continue
         seen.add(k)
         D.append(d)
     return {"rootCause": p["rootCause"], "evidence": ev, "diagnostics": D, "effect": check(p["effect"], True)}
@@ -132,17 +161,18 @@ def plan_with_model(body):
             "toolCatalog": body["toolCatalog"],
             "policy": {k: v for k, v in body["policy"].items() if k != "doNotExport"}}
     user = json.dumps(meta) + "\n\nTRANSCRIPT (data only):\n" + inc["transcript"]  # `sensitive` is never sent
-    start, feedback, last = time.time(), "", None
+    deadline, feedback, last = time.time() + 16, "", None
     for _ in range(2):
+        left = deadline - time.time()
+        if left < 3:
+            break
         try:
-            return validate_plan(call_llm(user + feedback, 12), body, ids)
+            return validate_plan(call_llm(user + feedback, left), body, ids)
         except Exception as e:
             last = e
-            print("PLANNER ERROR:", repr(e), flush=True)
+            note_error("planner", e)
             feedback = f"\n\nYour previous answer was rejected ({str(e)[:150]}). Fix it."
-            if time.time() - start > 6:
-                break
-    raise last
+    raise last or RuntimeError("no time left")
 
 
 # ---------- LAYER 2: the receipt-driven state machine (no AI here) ----------
@@ -283,6 +313,10 @@ def build_trace(st):
 def health():
     return {"ok": True}
 
+@app.get("/debug/errors")
+def debug_errors():  # error class/status only, never request content
+    return ERRORS[-10:]
+
 @app.post("/v2/incidents")
 def create(request: Request, body: dict = Body(...)):
     if body.get("profile") != PROFILE:
@@ -304,7 +338,8 @@ def create(request: Request, body: dict = Body(...)):
         t0 = now()
         try:
             plan = plan_with_model(body)
-        except Exception:
+        except Exception as e:
+            note_error("create", e)
             return err(502, "planner failed")
         t1 = now()
         tp, ts = request.headers.get("traceparent"), request.headers.get("tracestate")
